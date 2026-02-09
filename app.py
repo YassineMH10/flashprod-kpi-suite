@@ -235,7 +235,6 @@ def code2_build_agent_kpis(df_clean: pd.DataFrame) -> pd.DataFrame:
 
     unique_etats = df2["Etat"].dropna().unique()
     agent_base = df2[["Log Téléphonie1"]].drop_duplicates().reset_index(drop=True)
-
     agent_base["Log Téléphonie1"] = agent_base["Log Téléphonie1"].astype(str).str.strip()
 
     for etat in unique_etats:
@@ -326,7 +325,7 @@ def code2_build_agent_kpis(df_clean: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# CODE 3: Merge COMPO + Rapport (FIX int64 vs object)
+# CODE 3: Merge COMPO + Rapport
 # =========================
 def code3_merge_compo(df_compo: pd.DataFrame, df_rapport: pd.DataFrame) -> pd.DataFrame:
     if "Log Téléphonie1" not in df_compo.columns:
@@ -338,14 +337,10 @@ def code3_merge_compo(df_compo: pd.DataFrame, df_rapport: pd.DataFrame) -> pd.Da
     df_rapport = df_rapport.copy()
 
     df_compo["Log Téléphonie1"] = (
-        df_compo["Log Téléphonie1"]
-        .astype(str).str.strip()
-        .str.replace(r"\.0$", "", regex=True)
+        df_compo["Log Téléphonie1"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
     )
     df_rapport["Log Téléphonie1"] = (
-        df_rapport["Log Téléphonie1"]
-        .astype(str).str.strip()
-        .str.replace(r"\.0$", "", regex=True)
+        df_rapport["Log Téléphonie1"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
     )
 
     df_compo = df_compo[df_compo["Log Téléphonie1"].notna() & (df_compo["Log Téléphonie1"] != "")]
@@ -359,20 +354,11 @@ def code3_merge_compo(df_compo: pd.DataFrame, df_rapport: pd.DataFrame) -> pd.Da
     if "Matricule" in df_merged.columns:
         df_merged = df_merged.drop(columns=["Matricule"])
 
-    colonnes_apres_ops = [
-        "Temps Total présence", "Temps total Travail", "Taux d'occupation",
-        "Productivité", "DMC", "DMT"
-    ]
-
+    colonnes_apres_ops = ["Temps Total présence", "Temps total Travail", "Taux d'occupation", "Productivité", "DMC", "DMT"]
     ops_index = df_merged.columns.get_loc("OPS") + 1 if "OPS" in df_merged.columns else 0
     colonnes_sans = [c for c in df_merged.columns if c not in colonnes_apres_ops]
 
-    nouvel_ordre = (
-        colonnes_sans[:ops_index] +
-        [c for c in colonnes_apres_ops if c in df_merged.columns] +
-        colonnes_sans[ops_index:]
-    )
-
+    nouvel_ordre = colonnes_sans[:ops_index] + [c for c in colonnes_apres_ops if c in df_merged.columns] + colonnes_sans[ops_index:]
     return df_merged[nouvel_ordre]
 
 
@@ -469,8 +455,7 @@ def code4_build_flash_agent_excel(df_final3: pd.DataFrame) -> bytes:
             cell.value = "-"
         else:
             avg_sec = int(round(post_sec / appels))
-            td = timedelta(seconds=avg_sec)
-            cell.value = td
+            cell.value = timedelta(seconds=avg_sec)
             cell.number_format = "hh:mm:ss"
 
     if "Temps Total présence" in headers4:
@@ -514,7 +499,7 @@ def code4_build_flash_agent_excel(df_final3: pd.DataFrame) -> bytes:
 
 
 # =========================
-# CODE 5: Synthèse TL + conditional formatting (Streamlit Cloud FIX)
+# CODE 5: Synthèse TL + conditional formatting (Cloud-safe)
 # =========================
 def code5_add_tl_sheet(excel_agent_bytes: bytes) -> bytes:
     from openpyxl.worksheet.cell_range import MultiCellRange
@@ -529,21 +514,41 @@ def code5_add_tl_sheet(excel_agent_bytes: bytes) -> bytes:
     if "Productivité" in df5.columns:
         df5["Productivité"] = pd.to_numeric(df5["Productivité"], errors="coerce")
 
-    df5["Taux Post-travail"] = df5["Post-travail - Temps total"] / df5["Temps total Travail"]
-    df5["Taux d'occupation"] = df5["Temps total Travail"] / df5["Temps Total présence"]
+    if ("Post-travail - Temps total" in df5.columns) and ("Temps total Travail" in df5.columns):
+        df5["Taux Post-travail"] = df5["Post-travail - Temps total"] / df5["Temps total Travail"]
+    else:
+        df5["Taux Post-travail"] = np.nan
 
-    df_tl = (
-        df5.groupby("Tls")[["Productivité", "Taux Post-travail", "DMC", "DMT", "Taux d'occupation"]]
-        .mean()
-        .reset_index()
-    )
-    df_tl = df_tl[df_tl["Productivité"] > 0]
+    if ("Temps total Travail" in df5.columns) and ("Temps Total présence" in df5.columns):
+        df5["Taux d'occupation"] = df5["Temps total Travail"] / df5["Temps Total présence"]
+    else:
+        df5["Taux d'occupation"] = np.nan
 
-    total = pd.DataFrame([["TOTAL"] + df_tl.iloc[:, 1:].mean().tolist()], columns=df_tl.columns)
+    if "Tls" not in df5.columns:
+        raise ValueError("Colonne 'Tls' introuvable dans 'Flash Prod Agent'.")
+
+    cols_tl = ["Productivité", "Taux Post-travail", "DMC", "DMT", "Taux d'occupation"]
+    cols_tl = [c for c in cols_tl if c in df5.columns]
+
+    df_tl = df5.groupby("Tls")[cols_tl].mean().reset_index()
+    if "Productivité" in df_tl.columns:
+        df_tl = df_tl[df_tl["Productivité"] > 0]
+
+    # If empty -> still create sheet with header + TOTAL as NaN-safe
+    if df_tl.empty:
+        df_tl = pd.DataFrame(columns=["Tls"] + cols_tl)
+
+    total_vals = []
+    for c in cols_tl:
+        total_vals.append(df_tl[c].mean() if len(df_tl) else np.nan)
+
+    total = pd.DataFrame([["TOTAL"] + total_vals], columns=["Tls"] + cols_tl)
     df_tl = pd.concat([df_tl, total], ignore_index=True)
 
-    df_tl["DMC"] = pd.to_timedelta(df_tl["DMC"], unit="s")
-    df_tl["DMT"] = pd.to_timedelta(df_tl["DMT"], unit="s")
+    if "DMC" in df_tl.columns:
+        df_tl["DMC"] = pd.to_timedelta(df_tl["DMC"], unit="s", errors="coerce")
+    if "DMT" in df_tl.columns:
+        df_tl["DMT"] = pd.to_timedelta(df_tl["DMT"], unit="s", errors="coerce")
 
     if "Flash Prod TL" in wb5.sheetnames:
         del wb5["Flash Prod TL"]
@@ -569,7 +574,6 @@ def code5_add_tl_sheet(excel_agent_bytes: bytes) -> bytes:
         "DMC": "hh:mm:ss",
         "DMT": "hh:mm:ss"
     }
-
     for k, fmt in formats.items():
         if k in headers5:
             col = headers5[k]
@@ -586,32 +590,39 @@ def code5_add_tl_sheet(excel_agent_bytes: bytes) -> bytes:
             ws5.cell(r, c).border = border
             ws5.cell(r, c).alignment = Alignment(horizontal="center")
 
-    last_row = ws5.max_row
+    last_row = ws5.max_row  # includes TOTAL
 
     def add_cf_range(range_str: str, rule):
         ws5.conditional_formatting.add(MultiCellRange(range_str), rule)
 
-    if "Productivité" in headers5:
-        colL = get_column_letter(headers5["Productivité"])
-        add_cf_range(f"{colL}2:{colL}{last_row-1}", FormulaRule(formula=[f"{colL}2>13"], fill=green))
-        add_cf_range(f"{colL}2:{colL}{last_row-1}", FormulaRule(formula=[f"{colL}2<=13"], fill=red))
+    # ✅ Appliquer CF seulement si on a au moins 1 TL (row2) + TOTAL (row3) => last_row >= 3
+    if last_row >= 3:
+        end_row = last_row - 1  # exclude TOTAL row
 
-    if "Taux Post-travail" in headers5:
-        colL = get_column_letter(headers5["Taux Post-travail"])
-        add_cf_range(f"{colL}2:{colL}{last_row-1}", FormulaRule(formula=[f"{colL}2<=0.08"], fill=green))
-        add_cf_range(f"{colL}2:{colL}{last_row-1}", FormulaRule(formula=[f"{colL}2>0.08"], fill=red))
+        if "Productivité" in headers5:
+            colL = get_column_letter(headers5["Productivité"])
+            add_cf_range(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2>13"], fill=green))
+            add_cf_range(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2<=13"], fill=red))
 
-    for col_name in ["DMC", "DMT"]:
-        if col_name in headers5:
-            col_letter = get_column_letter(headers5[col_name])
-            add_cf_range(f"{col_letter}2:{col_letter}{last_row-1}", FormulaRule(formula=[f"{col_letter}2<=TIME(0,3,0)"], fill=green))
-            add_cf_range(f"{col_letter}2:{col_letter}{last_row-1}", FormulaRule(formula=[f"{col_letter}2>TIME(0,3,0)"], fill=red))
+        if "Taux Post-travail" in headers5:
+            colL = get_column_letter(headers5["Taux Post-travail"])
+            add_cf_range(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2<=0.08"], fill=green))
+            add_cf_range(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2>0.08"], fill=red))
 
-    if "Taux d'occupation" in headers5:
-        colL = get_column_letter(headers5["Taux d'occupation"])
-        add_cf_range(f"{colL}2:{colL}{last_row-1}", FormulaRule(formula=[f"{colL}2>=0.7"], fill=green))
-        add_cf_range(f"{colL}2:{colL}{last_row-1}", FormulaRule(formula=[f"{colL}2<0.7"], fill=red))
+        for col_name in ["DMC", "DMT"]:
+            if col_name in headers5:
+                col_letter = get_column_letter(headers5[col_name])
+                add_cf_range(f"{col_letter}2:{col_letter}{end_row}",
+                             FormulaRule(formula=[f"{col_letter}2<=TIME(0,3,0)"], fill=green))
+                add_cf_range(f"{col_letter}2:{col_letter}{end_row}",
+                             FormulaRule(formula=[f"{col_letter}2>TIME(0,3,0)"], fill=red))
 
+        if "Taux d'occupation" in headers5:
+            colL = get_column_letter(headers5["Taux d'occupation"])
+            add_cf_range(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2>=0.7"], fill=green))
+            add_cf_range(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2<0.7"], fill=red))
+
+    # Style TOTAL row
     for c in range(1, ws5.max_column + 1):
         ws5.cell(ws5.max_row, c).fill = total_fill
         ws5.cell(ws5.max_row, c).font = Font(bold=True)
@@ -634,12 +645,18 @@ def code6_build_email(excel_final_bytes: bytes, projet_upper: str, date_txt: str
     df_total = df_tl_email[df_tl_email["Tls"] == "TOTAL"].iloc[0]
     df_tl_email = df_tl_email[df_tl_email["Tls"] != "TOTAL"].copy()
 
-    kpi_prod = round(float(df_total["Productivité"]), 1)
-    kpi_occ = round(float(df_total["Taux d'occupation"]) * 100, 1)
-    kpi_post = round(float(df_total["Taux Post-travail"]) * 100, 1)
+    def safe_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return float("nan")
 
-    kpi_dmc_sec = time_to_seconds(df_total["DMC"])
-    kpi_dmt_sec = time_to_seconds(df_total["DMT"])
+    kpi_prod = round(safe_float(df_total.get("Productivité", np.nan)), 1) if pd.notna(df_total.get("Productivité", np.nan)) else 0.0
+    kpi_occ = round(safe_float(df_total.get("Taux d'occupation", 0)) * 100, 1) if pd.notna(df_total.get("Taux d'occupation", np.nan)) else 0.0
+    kpi_post = round(safe_float(df_total.get("Taux Post-travail", 0)) * 100, 1) if pd.notna(df_total.get("Taux Post-travail", np.nan)) else 0.0
+
+    kpi_dmc_sec = time_to_seconds(df_total.get("DMC", np.nan))
+    kpi_dmt_sec = time_to_seconds(df_total.get("DMT", np.nan))
     kpi_dmc_txt = sec_to_hms(kpi_dmc_sec)
     kpi_dmt_txt = sec_to_hms(kpi_dmt_sec)
 
@@ -700,25 +717,29 @@ def code6_build_email(excel_final_bytes: bytes, projet_upper: str, date_txt: str
     for i, r in df_tl_email.iterrows():
         bg = "#F9FAFB" if i % 2 == 0 else "#FFFFFF"
 
-        p_bg, p_cl = color_prod(float(r["Productivité"]))
-        pt_bg, pt_cl = color_post(float(r["Taux Post-travail"]))
+        prod = float(r.get("Productivité", 0)) if pd.notna(r.get("Productivité", np.nan)) else 0.0
+        tpost = float(r.get("Taux Post-travail", 0)) if pd.notna(r.get("Taux Post-travail", np.nan)) else 0.0
+        tocc = float(r.get("Taux d'occupation", 0)) if pd.notna(r.get("Taux d'occupation", np.nan)) else 0.0
 
-        dmc_sec = time_to_seconds(r["DMC"])
-        dmt_sec = time_to_seconds(r["DMT"])
+        p_bg, p_cl = color_prod(prod)
+        pt_bg, pt_cl = color_post(tpost)
+
+        dmc_sec = time_to_seconds(r.get("DMC", np.nan))
+        dmt_sec = time_to_seconds(r.get("DMT", np.nan))
 
         dmc_bg, dmc_cl = color_time(dmc_sec)
         dmt_bg, dmt_cl = color_time(dmt_sec)
 
-        occ_bg, occ_cl = color_occ(float(r["Taux d'occupation"]))
+        occ_bg, occ_cl = color_occ(tocc)
 
         table_html += f"""
         <tr style="background:{bg};">
           <td>{r['Tls']}</td>
-          <td style="background:{p_bg};color:{p_cl};font-weight:bold;">{round(float(r['Productivité']),1)}</td>
-          <td style="background:{pt_bg};color:{pt_cl};font-weight:bold;">{round(float(r['Taux Post-travail'])*100,1)}%</td>
+          <td style="background:{p_bg};color:{p_cl};font-weight:bold;">{round(prod,1)}</td>
+          <td style="background:{pt_bg};color:{pt_cl};font-weight:bold;">{round(tpost*100,1)}%</td>
           <td style="background:{dmc_bg};color:{dmc_cl};font-weight:bold;">{sec_to_hms(dmc_sec)}</td>
           <td style="background:{dmt_bg};color:{dmt_cl};font-weight:bold;">{sec_to_hms(dmt_sec)}</td>
-          <td style="background:{occ_bg};color:{occ_cl};font-weight:bold;">{round(float(r["Taux d'occupation"])*100,1)}%</td>
+          <td style="background:{occ_bg};color:{occ_cl};font-weight:bold;">{round(tocc*100,1)}%</td>
         </tr>
         """
 
@@ -828,20 +849,22 @@ def build_flop_from_excel(excel_final_bytes: bytes, kpi_choice: str, flop_n: int
     if score_col not in df.columns:
         raise ValueError(f"KPI '{kpi_choice}' not found in Agent sheet.")
 
+    # Remove <10min presence if column exists
     if "Temps Total présence" in df.columns:
         pres_sec = df["Temps Total présence"].apply(parse_hms_any_to_seconds)
         df = df[(pres_sec.isna()) | (pres_sec >= 600)].copy()
 
     df = df[df[score_col].notna()].copy()
 
+    # Worst direction: for "higher is better" => worst=lowest; for "lower is better" => worst=highest
     ascending = True if direction == "Worst (lowest)" else False
-    df_sorted = df.sort_values(score_col, ascending=ascending).head(flop_n).copy()
+    df_sorted = df.sort_values(score_col, ascending=ascending).head(int(flop_n)).copy()
 
     def fmt_value(v):
         if pd.isna(v):
             return "-"
         if kind == "percent":
-            return f"{float(v)*100:.1f}%".replace(".", ",")
+            return f"{float(v) * 100:.1f}%".replace(".", ",")
         if kind == "seconds":
             return sec_to_hms(float(v))
         return str(round(float(v), 2)).replace(".", ",")
@@ -968,11 +991,9 @@ flop_filename = None
 
 if enable_flop:
     if direction_mode == "Worst (auto)":
-        direction = "Worst (lowest)" if kpi_choice in ["Productivité", "Taux d'occupation"] else "Worst (highest)"
+        direction_label = "Worst (lowest)" if kpi_choice in ["Productivité", "Taux d'occupation"] else "Worst (highest)"
     else:
-        direction = direction_mode
-
-    direction_label = "Worst (lowest)" if direction == "Worst (lowest)" else "Worst (highest)"
+        direction_label = direction_mode
 
     try:
         df_flop = build_flop_from_excel(excel_final_bytes, kpi_choice, int(flop_n), direction_label)
