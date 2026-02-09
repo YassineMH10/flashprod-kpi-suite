@@ -63,7 +63,6 @@ def to_seconds(val):
     if isinstance(val, str) and ":" in val:
         parts = val.split(":")
         if len(parts) >= 2:
-            # HH:MM or HH:MM:SS
             h = int(parts[0])
             m = int(parts[1])
             s = int(parts[2]) if len(parts) >= 3 else 0
@@ -89,13 +88,12 @@ def time_to_seconds(val):
 
 
 def sec_to_hms(sec):
-    if sec is None:
+    if sec is None or (isinstance(sec, float) and np.isnan(sec)):
         return "-"
-    return str(timedelta(seconds=int(sec)))
+    return str(timedelta(seconds=int(float(sec))))
 
 
 def to_hms(val):
-    # "3h12'05" -> "03:12:05"
     if isinstance(val, str):
         match = re.match(r"(\d+)h(\d+)'(\d+)", val)
         if match:
@@ -105,11 +103,9 @@ def to_hms(val):
 
 
 def parse_percent_any(v):
-    """Accepts 0.12, '12%', '12.0%', '0.12', '-' -> float (0..1) or NaN."""
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return np.nan
     if isinstance(v, (int, float)):
-        # Could be already 0..1 or 0..100, we assume 0..1 if <= 1.5
         return float(v) if float(v) <= 1.5 else float(v) / 100.0
     s = str(v).strip()
     if s in ("-", "", "nan", "None"):
@@ -128,7 +124,6 @@ def parse_percent_any(v):
 
 
 def parse_hms_any_to_seconds(v):
-    """Accepts timedelta, datetime.time, 'HH:MM:SS', 'HH:MM' -> seconds or NaN."""
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return np.nan
     if isinstance(v, timedelta):
@@ -139,7 +134,6 @@ def parse_hms_any_to_seconds(v):
     if s in ("-", "", "nan", "None"):
         return np.nan
     try:
-        # pandas can parse many time strings
         td = pd.to_timedelta(s, errors="coerce")
         if pd.isna(td):
             return np.nan
@@ -242,7 +236,6 @@ def code2_build_agent_kpis(df_clean: pd.DataFrame) -> pd.DataFrame:
     unique_etats = df2["Etat"].dropna().unique()
     agent_base = df2[["Log Téléphonie1"]].drop_duplicates().reset_index(drop=True)
 
-    # ✅ sécurisation type clé
     agent_base["Log Téléphonie1"] = agent_base["Log Téléphonie1"].astype(str).str.strip()
 
     for etat in unique_etats:
@@ -344,7 +337,6 @@ def code3_merge_compo(df_compo: pd.DataFrame, df_rapport: pd.DataFrame) -> pd.Da
     df_compo = df_compo.copy()
     df_rapport = df_rapport.copy()
 
-    # Cast en string + nettoyage
     df_compo["Log Téléphonie1"] = (
         df_compo["Log Téléphonie1"]
         .astype(str).str.strip()
@@ -436,7 +428,6 @@ def code4_build_flash_agent_excel(df_final3: pd.DataFrame) -> bytes:
             for r in range(2, ws4.max_row + 1):
                 ws4.cell(r, headers4[name]).number_format = "hh:mm:ss"
 
-    # Add "Taux Post-travail"
     if "Post-travail - Temps total" in headers4 and "Temps total Travail" in headers4:
         col_post = headers4["Post-travail - Temps total"]
         ws4.insert_cols(col_post + 1)
@@ -454,7 +445,6 @@ def code4_build_flash_agent_excel(df_final3: pd.DataFrame) -> bytes:
             cell.value = round(post / work, 4)
             cell.number_format = "0.00%"
 
-    # Add "Moy Post-travail"
     if "Taux Post-travail" in headers4:
         col_taux_post = headers4["Taux Post-travail"]
         ws4.insert_cols(col_taux_post + 1)
@@ -464,8 +454,8 @@ def code4_build_flash_agent_excel(df_final3: pd.DataFrame) -> bytes:
 
     for r in range(2, ws4.max_row + 1):
         post_sec = to_seconds(ws4.cell(r, headers4.get("Post-travail - Temps total")).value) if "Post-travail - Temps total" in headers4 else None
-
         appels_val = ws4.cell(r, headers4.get("Appels entrants")).value if "Appels entrants" in headers4 else None
+
         if appels_val in ("-", None, ""):
             appels = None
         else:
@@ -483,7 +473,6 @@ def code4_build_flash_agent_excel(df_final3: pd.DataFrame) -> bytes:
             cell.value = td
             cell.number_format = "hh:mm:ss"
 
-    # Rule < 10 min presence: set "-" from presence col to end
     if "Temps Total présence" in headers4:
         col_presence = headers4["Temps Total présence"]
         for r in range(2, ws4.max_row + 1):
@@ -492,7 +481,6 @@ def code4_build_flash_agent_excel(df_final3: pd.DataFrame) -> bytes:
                 for c in range(col_presence, ws4.max_column + 1):
                     ws4.cell(r, c).value = "-"
 
-    # Style final
     header_fill = PatternFill("solid", "D9E1F2")
     alt_fill = PatternFill("solid", "F7F7F7")
     thin = Side(style="thin")
@@ -526,9 +514,11 @@ def code4_build_flash_agent_excel(df_final3: pd.DataFrame) -> bytes:
 
 
 # =========================
-# CODE 5: Synthèse TL + conditional formatting (Excel final)
+# CODE 5: Synthèse TL + conditional formatting (Streamlit Cloud FIX)
 # =========================
 def code5_add_tl_sheet(excel_agent_bytes: bytes) -> bytes:
+    from openpyxl.worksheet.cell_range import MultiCellRange
+
     wb5 = load_workbook(BytesIO(excel_agent_bytes))
     df5 = pd.read_excel(BytesIO(excel_agent_bytes), sheet_name="Flash Prod Agent", engine="openpyxl")
 
@@ -598,56 +588,30 @@ def code5_add_tl_sheet(excel_agent_bytes: bytes) -> bytes:
 
     last_row = ws5.max_row
 
-    # Productivité > 13 green else red
+    def add_cf_range(range_str: str, rule):
+        ws5.conditional_formatting.add(MultiCellRange(range_str), rule)
+
     if "Productivité" in headers5:
         colL = get_column_letter(headers5["Productivité"])
-        ws5.conditional_formatting.add(
-            f"{colL}2:{colL}{last_row-1}",
-            FormulaRule(formula=[f"{colL}2>13"], fill=green)
-        )
-        ws5.conditional_formatting.add(
-            f"{colL}2:{colL}{last_row-1}",
-            FormulaRule(formula=[f"{colL}2<=13"], fill=red)
-        )
+        add_cf_range(f"{colL}2:{colL}{last_row-1}", FormulaRule(formula=[f"{colL}2>13"], fill=green))
+        add_cf_range(f"{colL}2:{colL}{last_row-1}", FormulaRule(formula=[f"{colL}2<=13"], fill=red))
 
-    # Taux Post <= 0.08 green else red
     if "Taux Post-travail" in headers5:
         colL = get_column_letter(headers5["Taux Post-travail"])
-        ws5.conditional_formatting.add(
-            f"{colL}2:{colL}{last_row-1}",
-            FormulaRule(formula=[f"{colL}2<=0.08"], fill=green)
-        )
-        ws5.conditional_formatting.add(
-            f"{colL}2:{colL}{last_row-1}",
-            FormulaRule(formula=[f"{colL}2>0.08"], fill=red)
-        )
+        add_cf_range(f"{colL}2:{colL}{last_row-1}", FormulaRule(formula=[f"{colL}2<=0.08"], fill=green))
+        add_cf_range(f"{colL}2:{colL}{last_row-1}", FormulaRule(formula=[f"{colL}2>0.08"], fill=red))
 
-    # DMC/DMT <= 03:00 green else red
     for col_name in ["DMC", "DMT"]:
         if col_name in headers5:
             col_letter = get_column_letter(headers5[col_name])
-            ws5.conditional_formatting.add(
-                f"{col_letter}2:{col_letter}{last_row-1}",
-                FormulaRule(formula=[f"{col_letter}2<=TIME(0,3,0)"], fill=green)
-            )
-            ws5.conditional_formatting.add(
-                f"{col_letter}2:{col_letter}{last_row-1}",
-                FormulaRule(formula=[f"{col_letter}2>TIME(0,3,0)"], fill=red)
-            )
+            add_cf_range(f"{col_letter}2:{col_letter}{last_row-1}", FormulaRule(formula=[f"{col_letter}2<=TIME(0,3,0)"], fill=green))
+            add_cf_range(f"{col_letter}2:{col_letter}{last_row-1}", FormulaRule(formula=[f"{col_letter}2>TIME(0,3,0)"], fill=red))
 
-    # Occupation >= 0.7 green else red
     if "Taux d'occupation" in headers5:
         colL = get_column_letter(headers5["Taux d'occupation"])
-        ws5.conditional_formatting.add(
-            f"{colL}2:{colL}{last_row-1}",
-            FormulaRule(formula=[f"{colL}2>=0.7"], fill=green)
-        )
-        ws5.conditional_formatting.add(
-            f"{colL}2:{colL}{last_row-1}",
-            FormulaRule(formula=[f"{colL}2<0.7"], fill=red)
-        )
+        add_cf_range(f"{colL}2:{colL}{last_row-1}", FormulaRule(formula=[f"{colL}2>=0.7"], fill=green))
+        add_cf_range(f"{colL}2:{colL}{last_row-1}", FormulaRule(formula=[f"{colL}2<0.7"], fill=red))
 
-    # Ligne TOTAL style
     for c in range(1, ws5.max_column + 1):
         ws5.cell(ws5.max_row, c).fill = total_fill
         ws5.cell(ws5.max_row, c).font = Font(bold=True)
@@ -827,18 +791,13 @@ def copy_buttons(subject: str, html_body: str):
 
 
 # =========================
-# FLOP generator (agent worst list)
+# FLOP generator
 # =========================
 def build_flop_from_excel(excel_final_bytes: bytes, kpi_choice: str, flop_n: int, direction: str) -> pd.DataFrame:
     df_agents = pd.read_excel(BytesIO(excel_final_bytes), sheet_name="Flash Prod Agent", engine="openpyxl")
-
-    # Keep common identifiers if present
     base_cols = [c for c in ["Matricule RH", "Log Téléphonie1", "Nom Agent", "File", "Tls", "OPS"] if c in df_agents.columns]
-
-    # Build numeric score based on KPI
     df = df_agents.copy()
 
-    # Standard conversions
     if "Productivité" in df.columns:
         df["__prod"] = pd.to_numeric(df["Productivité"], errors="coerce")
 
@@ -865,28 +824,19 @@ def build_flop_from_excel(excel_final_bytes: bytes, kpi_choice: str, flop_n: int
         "DMT": ("__dmt_sec", "seconds"),
         "Moy Post-travail": ("__mpost_sec", "seconds"),
     }
-    if kpi_choice not in mapping:
-        raise ValueError(f"KPI '{kpi_choice}' not supported.")
-
     score_col, kind = mapping[kpi_choice]
     if score_col not in df.columns:
         raise ValueError(f"KPI '{kpi_choice}' not found in Agent sheet.")
 
-    # remove invalid scores and tiny presence rows if possible
     if "Temps Total présence" in df.columns:
         pres_sec = df["Temps Total présence"].apply(parse_hms_any_to_seconds)
-        df = df[(pres_sec.isna()) | (pres_sec >= 600)].copy()  # keep valid presence >= 10 min
+        df = df[(pres_sec.isna()) | (pres_sec >= 600)].copy()
 
     df = df[df[score_col].notna()].copy()
 
-    # Sorting (direction: "Worst" / "Best")
     ascending = True if direction == "Worst (lowest)" else False
-
-    # But for some KPIs, "worst" is actually highest (times/post rate)
-    # We'll set default "worst" logic if user selected "Worst (auto)" in UI outside.
     df_sorted = df.sort_values(score_col, ascending=ascending).head(flop_n).copy()
 
-    # Display formatting
     def fmt_value(v):
         if pd.isna(v):
             return "-"
@@ -900,7 +850,6 @@ def build_flop_from_excel(excel_final_bytes: bytes, kpi_choice: str, flop_n: int
     df_sorted["Valeur KPI"] = df_sorted[score_col].apply(fmt_value)
 
     out_cols = base_cols + ["KPI", "Valeur KPI"]
-    # Add helpful columns if present
     for extra in ["Temps Total présence", "Appels entrants", "Post-travail - Temps total", "Temps total Travail"]:
         if extra in df_sorted.columns and extra not in out_cols:
             out_cols.append(extra)
@@ -945,7 +894,6 @@ with st.sidebar:
     )
     flop_n = st.number_input("Nombre d'agents FLOP", min_value=5, max_value=200, value=20, step=5, disabled=not enable_flop)
 
-    # Direction: allow override
     direction_mode = st.radio(
         "Tri FLOP",
         ["Worst (auto)", "Worst (lowest)", "Worst (highest)"],
@@ -968,7 +916,6 @@ if not raw_file or not compo_file:
     st.error("BRUT + COMPO sont obligatoires.")
     st.stop()
 
-# Validate date
 try:
     date_obj = datetime.strptime(date_input.strip(), "%d/%m/%Y")
 except Exception:
@@ -989,32 +936,25 @@ def log_ok(msg):
 
 
 try:
-    # Read inputs
     df_raw = read_excel_any(raw_file)
     df_compo = read_excel_any(compo_file)
 
-    # CODE 1
     df_clean = code1_clean_raw(df_raw)
     log_ok("✅ CODE 1 OK → Nettoyage BRUT terminé")
 
-    # CODE 2
     df_rapport = code2_build_agent_kpis(df_clean)
     log_ok("✅ CODE 2 OK → KPI Agent / Pivot terminé")
 
-    # CODE 3 (FIX merge types)
     df_final3 = code3_merge_compo(df_compo, df_rapport)
     log_ok("✅ CODE 3 OK → Merge COMPO + Rapport terminé")
 
-    # CODE 4
     agent_excel_bytes = code4_build_flash_agent_excel(df_final3)
     log_ok("✅ CODE 4 OK → Flash Prod Agent (Excel) généré")
 
-    # CODE 5
     excel_final_bytes = code5_add_tl_sheet(agent_excel_bytes)
     excel_final_name = f"Flash_Prod_{projet_upper}_{date_flash}.xlsx"
     log_ok(f"✅ CODE 5 OK → Excel final prêt ({excel_final_name})")
 
-    # CODE 6 (signature user)
     email_subject, email_html = code6_build_email(excel_final_bytes, projet_upper, date_txt, signature_name)
     log_ok("✅ CODE 6 OK → Email (Objet + Corps HTML) généré")
 
@@ -1022,26 +962,16 @@ except Exception as e:
     st.error(f"Erreur pipeline: {e}")
     st.stop()
 
-# FLOP generation (optional)
 df_flop = None
 flop_excel_bytes = None
 flop_filename = None
 
 if enable_flop:
-    # Auto direction rule
-    # - Lower is worse for: Productivité, Taux d'occupation
-    # - Higher is worse for: Taux Post-travail, DMC, DMT, Moy Post-travail
     if direction_mode == "Worst (auto)":
-        if kpi_choice in ["Productivité", "Taux d'occupation"]:
-            direction = "Worst (lowest)"
-        else:
-            direction = "Worst (highest)"
+        direction = "Worst (lowest)" if kpi_choice in ["Productivité", "Taux d'occupation"] else "Worst (highest)"
     else:
         direction = direction_mode
 
-    # Map to ascending flag via labels
-    # "Worst (lowest)" => ascending True; "Worst (highest)" => ascending False
-    # We'll pass as "Worst (lowest)" or "Worst (highest)" to build_flop
     direction_label = "Worst (lowest)" if direction == "Worst (lowest)" else "Worst (highest)"
 
     try:
@@ -1051,9 +981,6 @@ if enable_flop:
     except Exception as e:
         st.warning(f"FLOP non généré: {e}")
 
-# =========================
-# Outputs
-# =========================
 col1, col2 = st.columns([1.15, 0.85], gap="large")
 
 with col1:
