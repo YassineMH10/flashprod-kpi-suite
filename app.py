@@ -1,12 +1,13 @@
+# app.py
 # ============================================================
-# ✅ FlashProd KPI Suite (STREAMLIT) — VERSION COMPLÈTE À JOUR
-# ✅ Ajouts TL:
-#   - Agents présents (>=10 min) en premier
-#   - Agents < 13 juste après Productivité
-#   - Heures Meeting / Training / OJT / Coaching total
+# ✅ STREAMLIT APP : FlashProd KPI Suite (VERSION À JOUR)
+# ✅ Pipeline BRUT + COMPO -> KPI Agents -> Excel final (2 sheets) + Email HTML
+# ✅ Ajouts TL :
+#   - Agents présents (>=10 min)
+#   - Agents < 13 (Productivité < 13, présents)
+#   - Heures Meeting / Training / OJT + Heures Coaching Total
 #   - % Coaching vs Connecté
-# ✅ Email: bandeau + table TL avec % coaching + counts
-# ✅ Output: Excel final + Email HTML + FLOP optionnel
+# ✅ Email : bandeau + tableau avec colonnes Agents/Coaching
 # ============================================================
 
 import streamlit as st
@@ -21,12 +22,10 @@ from openpyxl.styles import Alignment, Font, Border, Side, PatternFill
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.utils import get_column_letter
 
-
 # =========================
 # Streamlit config
 # =========================
 st.set_page_config(page_title="FlashProd KPI Suite", layout="wide")
-
 
 # =========================
 # Helpers
@@ -39,6 +38,21 @@ def read_excel_any(uploaded_file) -> pd.DataFrame:
     return pd.read_excel(bio, engine="openpyxl")
 
 
+def extract_log_any(text) -> str | None:
+    if text is None or (isinstance(text, float) and np.isnan(text)):
+        return None
+    t = str(text)
+
+    m = re.search(r"(?:agent|log|id)\D*(\d{4,6})", t, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"(\d{4,6})", t)
+    if m:
+        return m.group(1)
+    return None
+
+
 def normalize_log_series(s: pd.Series) -> pd.Series:
     s = s.astype(str).str.strip()
     s = s.str.replace(r"\.0$", "", regex=True)
@@ -47,25 +61,12 @@ def normalize_log_series(s: pd.Series) -> pd.Series:
     return s
 
 
-def extract_log_any(text) -> str | None:
-    if text is None or (isinstance(text, float) and np.isnan(text)):
-        return None
-    t = str(text)
-    m = re.search(r"(?:agent|log|id)\D*(\d{4,6})", t, flags=re.IGNORECASE)
-    if m:
-        return m.group(1)
-    m = re.search(r"(\d{4,6})", t)
-    if m:
-        return m.group(1)
-    return None
-
-
 def to_td(val):
     if val is None:
         return timedelta(0)
     if isinstance(val, str):
         v = val.strip()
-        if v in ("-", "", "0", "00:00:00"):
+        if v in ("-", "", "0", "00:00:00", "nan", "None"):
             return timedelta(0)
         mm = re.match(r"(\d+)h(\d+)'(\d+)", v)
         if mm:
@@ -122,19 +123,19 @@ def to_seconds(val):
 
 
 def time_to_seconds(val):
-    if pd.isna(val):
+    if val is None or (isinstance(val, float) and np.isnan(val)):
         return None
     if isinstance(val, timedelta):
-        return val.total_seconds()
+        return float(val.total_seconds())
     if isinstance(val, time):
-        return val.hour * 3600 + val.minute * 60 + val.second
+        return float(val.hour * 3600 + val.minute * 60 + val.second)
     if isinstance(val, str) and ":" in val:
         parts = val.split(":")
         if len(parts) >= 2:
             h = int(parts[0])
             m = int(parts[1])
             s = int(parts[2]) if len(parts) >= 3 else 0
-            return h * 3600 + m * 60 + s
+            return float(h * 3600 + m * 60 + s)
     return None
 
 
@@ -142,6 +143,14 @@ def sec_to_hms(sec):
     if sec is None or (isinstance(sec, float) and np.isnan(sec)):
         return "-"
     return str(timedelta(seconds=int(float(sec))))
+
+
+def to_sec_series(s: pd.Series) -> pd.Series:
+    # Convertit une colonne "hh:mm:ss" / timedelta / "-" en secondes float
+    s2 = s.copy()
+    if s2.dtype == object:
+        s2 = s2.replace("-", np.nan)
+    return pd.to_timedelta(s2, errors="coerce").dt.total_seconds()
 
 
 def parse_percent_any(v):
@@ -205,34 +214,42 @@ def kpi_or_dash_pct(v, digits=1):
 def code1_clean_raw(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(how="all").dropna(axis=1, how="all")
 
+    # rename typical exports
     rename_map = {}
-    if "Unnamed: 0" in df.columns: rename_map["Unnamed: 0"] = "Nom Agent"
-    if "Unnamed: 1" in df.columns: rename_map["Unnamed: 1"] = "Etat"
-    if "Unnamed: 4" in df.columns: rename_map["Unnamed: 4"] = "Occurances"
-    if "Unnamed: 6" in df.columns: rename_map["Unnamed: 6"] = "Temps total"
+    if "Unnamed: 0" in df.columns:
+        rename_map["Unnamed: 0"] = "Nom Agent"
+        df["Unnamed: 0"] = df["Unnamed: 0"].fillna(method="ffill")
+    if "Unnamed: 1" in df.columns:
+        rename_map["Unnamed: 1"] = "Etat"
+    if "Unnamed: 4" in df.columns:
+        rename_map["Unnamed: 4"] = "Occurances"
+    if "Unnamed: 6" in df.columns:
+        rename_map["Unnamed: 6"] = "Temps total"
     df = df.rename(columns=rename_map)
 
     for col in ["Nom Agent", "Etat", "Occurances", "Temps total"]:
         if col not in df.columns:
             df[col] = np.nan
 
-    df = df[df["Etat"].notna()]
+    df = df[df["Etat"].notna()].copy()
 
+    # extract log
     df.insert(0, "Log Téléphonie1", df["Nom Agent"].apply(extract_log_any))
     df["Log Téléphonie1"] = normalize_log_series(df["Log Téléphonie1"])
 
+    # normalize Etat
     df["Etat"] = df["Etat"].astype(str).str.strip()
     df["Etat"] = df["Etat"].replace({
         "Attente": "Attente global",
         "Pause": "Pause global",
         "Preview": "Histo Mailing"
     })
-    df = df[df["Etat"].astype(str).str.lower() != "en attente"]
+    df = df[df["Etat"].astype(str).str.lower() != "en attente"].copy()
 
-    df["Temps total"] = df["Temps total"].apply(
-        lambda x: fmt_hms(to_td(x)) if str(x).strip() not in ("-", "", "nan") else "-"
-    )
+    # normalize time display to hh:mm:ss (string)
+    df["Temps total"] = df["Temps total"].apply(lambda x: fmt_hms(to_td(x)) if str(x).strip() not in ("-", "", "nan") else "-")
 
+    # Fix second pause -> Pause générique
     def rename_second_pause(group):
         pauses = group[group["Etat"] == "Pause"].index
         if len(pauses) > 1:
@@ -248,10 +265,6 @@ def code1_clean_raw(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 def code2_build_agent_kpis(df_clean: pd.DataFrame) -> pd.DataFrame:
     df2 = df_clean.copy()
-
-    if "Log Téléphonie1" not in df2.columns:
-        df2["Log Téléphonie1"] = df2["Nom Agent"].apply(extract_log_any)
-    df2["Log Téléphonie1"] = normalize_log_series(df2["Log Téléphonie1"])
     df2 = df2[df2["Log Téléphonie1"].notna()].copy()
 
     unique_etats = df2["Etat"].dropna().unique()
@@ -343,7 +356,6 @@ def code2_build_agent_kpis(df_clean: pd.DataFrame) -> pd.DataFrame:
         return fmt_hms(total)
 
     agent_base["DMT"] = agent_base.apply(calc_dmt, axis=1)
-
     return agent_base
 
 
@@ -378,7 +390,7 @@ def code3_merge_compo(df_compo: pd.DataFrame, df_rapport: pd.DataFrame) -> tuple
     df_merged.drop(columns=["_merge"], inplace=True)
 
     if "Nom Agent" in df_merged.columns:
-        df_merged = df_merged[df_merged["Nom Agent"].notna() & (df_merged["Nom Agent"] != "")]
+        df_merged = df_merged[df_merged["Nom Agent"].notna() & (df_merged["Nom Agent"] != "")].copy()
 
     colonnes_apres_ops = ["Temps Total présence", "Temps total Travail", "Taux d'occupation", "Productivité", "DMC", "DMT"]
     ops_index = df_merged.columns.get_loc("OPS") + 1 if "OPS" in df_merged.columns else 0
@@ -389,11 +401,10 @@ def code3_merge_compo(df_compo: pd.DataFrame, df_rapport: pd.DataFrame) -> tuple
 
 
 # =========================
-# CODE 4: Flash Prod Agent (Excel)
+# CODE 4: Flash Prod Agent (Excel bytes) + add Taux Post + Moy Post + purge <10min
 # =========================
 def code4_build_flash_agent_excel(df_final3: pd.DataFrame) -> bytes:
-    df4 = df_final3.copy()
-    df4 = df4.fillna("-")
+    df4 = df_final3.copy().fillna("-")
 
     if "Appel entrant - Occurence" in df4.columns:
         df4 = df4.rename(columns={"Appel entrant - Occurence": "Appels entrants"})
@@ -418,9 +429,9 @@ def code4_build_flash_agent_excel(df_final3: pd.DataFrame) -> bytes:
     wb = load_workbook(buf)
     ws = wb.active
     ws.title = "Flash Prod Agent"
-
     headers = {cell.value: cell.column for cell in ws[1]}
 
+    # formats
     text_cols = ["Matricule RH","Log Téléphonie1","Nom Agent","File","Tls","OPS"]
     time_cols = [
         "Temps Total présence","Temps total Travail","DMC","DMT",
@@ -484,7 +495,7 @@ def code4_build_flash_agent_excel(df_final3: pd.DataFrame) -> bytes:
                 cell.value = timedelta(seconds=int(round(post_sec / appels)))
                 cell.number_format = "hh:mm:ss"
 
-    # rule <10min presence
+    # purge <10 min presence
     if "Temps Total présence" in headers:
         col_presence = headers["Temps Total présence"]
         for r in range(2, ws.max_row + 1):
@@ -514,7 +525,6 @@ def code4_build_flash_agent_excel(df_final3: pd.DataFrame) -> bytes:
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
     ws.freeze_panes = "A2"
-
     for col in ws.columns:
         vals = [str(cell.value) for cell in col if cell.value not in (None, "")]
         ws.column_dimensions[get_column_letter(col[0].column)].width = max([len(v) for v in vals], default=10) + 2
@@ -526,68 +536,79 @@ def code4_build_flash_agent_excel(df_final3: pd.DataFrame) -> bytes:
 
 
 # =========================
-# CODE 5: Synthèse TL + Coaching + Counts + CF
+# CODE 5: Add TL sheet (agents présents, <13, coaching, heures)
 # =========================
-def code5_add_tl_sheet(excel_agent_bytes: bytes) -> bytes:
-    from openpyxl.worksheet.cell_range import MultiCellRange
-
+def code5_add_tl_sheet_with_coaching(excel_agent_bytes: bytes) -> bytes:
     wb = load_workbook(BytesIO(excel_agent_bytes))
-    df = pd.read_excel(BytesIO(excel_agent_bytes), sheet_name="Flash Prod Agent", engine="openpyxl")
+    df5 = pd.read_excel(BytesIO(excel_agent_bytes), sheet_name="Flash Prod Agent", engine="openpyxl")
 
-    if "Tls" not in df.columns:
+    # conversions en secondes (float)
+    secs_cols = [
+        "Temps Total présence", "Temps total Travail", "Post-travail - Temps total",
+        "DMC", "DMT", "Meeting - Temps total", "Training - Temps total", "OJT - Temps total"
+    ]
+    for c in secs_cols:
+        if c in df5.columns:
+            df5[c] = to_sec_series(df5[c])
+
+    if "Productivité" in df5.columns:
+        df5["Productivité"] = pd.to_numeric(df5["Productivité"], errors="coerce")
+
+    # assure cols coaching
+    for c in ["Meeting - Temps total", "Training - Temps total", "OJT - Temps total"]:
+        if c not in df5.columns:
+            df5[c] = 0.0
+
+    df5["Temps Coaching (Mtg+Tr+OJT)"] = (
+        df5["Meeting - Temps total"].fillna(0) +
+        df5["Training - Temps total"].fillna(0) +
+        df5["OJT - Temps total"].fillna(0)
+    )
+
+    # présence valide (>=10 min)
+    present_mask = df5["Temps Total présence"].fillna(0) >= 600
+
+    # garder lignes où présence > 0 (évite divisions)
+    df5 = df5[df5["Temps Total présence"].fillna(0) > 0].copy()
+    if "Tls" not in df5.columns:
         raise ValueError("Colonne 'Tls' introuvable dans Flash Prod Agent.")
 
-    def to_sec_col(colname: str) -> pd.Series:
-        if colname not in df.columns:
-            return pd.Series([np.nan] * len(df))
-        return pd.to_timedelta(df[colname].replace("-", np.nan), errors="coerce").dt.total_seconds()
+    g = df5.groupby("Tls", dropna=False)
 
-    df["__presence_sec"] = to_sec_col("Temps Total présence")
-    df["__work_sec"] = to_sec_col("Temps total Travail")
-    df["__post_sec"] = to_sec_col("Post-travail - Temps total")
-    df["__dmc_sec"] = to_sec_col("DMC")
-    df["__dmt_sec"] = to_sec_col("DMT")
+    sum_presence = g["Temps Total présence"].sum()
+    sum_work = g["Temps total Travail"].sum() if "Temps total Travail" in df5.columns else pd.Series(0, index=sum_presence.index)
+    sum_post = g["Post-travail - Temps total"].sum() if "Post-travail - Temps total" in df5.columns else pd.Series(0, index=sum_presence.index)
 
-    df["__meeting_sec"] = to_sec_col("Meeting - Temps total")
-    df["__training_sec"] = to_sec_col("Training - Temps total")
-    df["__ojt_sec"] = to_sec_col("OJT - Temps total")
-    df["__coaching_sec"] = df["__meeting_sec"].fillna(0) + df["__training_sec"].fillna(0) + df["__ojt_sec"].fillna(0)
+    sum_meeting = g["Meeting - Temps total"].sum()
+    sum_training = g["Training - Temps total"].sum()
+    sum_ojt = g["OJT - Temps total"].sum()
+    sum_coaching = g["Temps Coaching (Mtg+Tr+OJT)"].sum()
 
-    df["__prod"] = pd.to_numeric(df["Productivité"], errors="coerce") if "Productivité" in df.columns else np.nan
-
-    present_mask = df["__presence_sec"].fillna(0) >= 600
-
-    g = df.groupby("Tls", dropna=False)
-
-    sum_presence = g["__presence_sec"].sum()
-    sum_work = g["__work_sec"].sum()
-    sum_post = g["__post_sec"].sum()
-
-    sum_meeting = g["__meeting_sec"].sum()
-    sum_training = g["__training_sec"].sum()
-    sum_ojt = g["__ojt_sec"].sum()
-    sum_coaching = g["__coaching_sec"].sum()
-
-    agent_id_col = "Log Téléphonie1" if "Log Téléphonie1" in df.columns else ("Nom Agent" if "Nom Agent" in df.columns else None)
-
-    if agent_id_col is None:
-        agents_presents = df[present_mask].groupby("Tls").size()
-        agents_lt13 = df[present_mask & df["__prod"].notna() & (df["__prod"] > 0) & (df["__prod"] < 13)].groupby("Tls").size()
+    # counts
+    if "Log Téléphonie1" in df5.columns:
+        agents_presents = df5[present_mask].groupby("Tls")["Log Téléphonie1"].nunique()
     else:
-        agents_presents = df[present_mask].groupby("Tls")[agent_id_col].nunique()
-        agents_lt13 = df[present_mask & df["__prod"].notna() & (df["__prod"] > 0) & (df["__prod"] < 13)].groupby("Tls")[agent_id_col].nunique()
+        agents_presents = df5[present_mask].groupby("Tls").size()
 
-    idx = sum_presence.index
+    prod_mask = present_mask & df5["Productivité"].notna() & (df5["Productivité"] > 0)
+    if "Log Téléphonie1" in df5.columns:
+        agents_lt13 = df5[prod_mask & (df5["Productivité"] < 13)].groupby("Tls")["Log Téléphonie1"].nunique()
+    else:
+        agents_lt13 = df5[prod_mask & (df5["Productivité"] < 13)].groupby("Tls").size()
 
+    # KPI TL
     df_tl = pd.DataFrame({
-        "Tls": idx,
-        "Agents présents": agents_presents.reindex(idx).fillna(0).astype(int),
-        "Productivité": g["__prod"].mean(),
-        "Agents < 13": agents_lt13.reindex(idx).fillna(0).astype(int),
+        "Tls": sum_presence.index,
+        "Agents présents": agents_presents.reindex(sum_presence.index).fillna(0).astype(int),
+        "Productivité": g["Productivité"].mean(),
+        "Agents < 13": agents_lt13.reindex(sum_presence.index).fillna(0).astype(int),
+
         "Taux Post-travail": (sum_post / sum_work).replace([np.inf, -np.inf], np.nan),
         "Taux d'occupation": (sum_work / sum_presence).replace([np.inf, -np.inf], np.nan),
-        "DMC": g["__dmc_sec"].mean(),
-        "DMT": g["__dmt_sec"].mean(),
+
+        "DMC": g["DMC"].mean() if "DMC" in df5.columns else np.nan,
+        "DMT": g["DMT"].mean() if "DMT" in df5.columns else np.nan,
+
         "Heures Meeting": sum_meeting,
         "Heures Training": sum_training,
         "Heures OJT": sum_ojt,
@@ -595,29 +616,32 @@ def code5_add_tl_sheet(excel_agent_bytes: bytes) -> bytes:
         "% Coaching vs Connecté": (sum_coaching / sum_presence).replace([np.inf, -np.inf], np.nan),
     }).reset_index(drop=True)
 
-    df_tl = df_tl[(df_tl["Agents présents"] > 0) | (df_tl["Productivité"].fillna(0) > 0)].copy()
+    df_tl = df_tl[df_tl["Productivité"].fillna(0) > 0].copy()
 
+    # TOTAL
     total_row = {
         "Tls": "TOTAL",
-        "Agents présents": int(agents_presents.sum()),
-        "Productivité": df_tl[df_tl["Tls"] != "TOTAL"]["Productivité"].mean(),
-        "Agents < 13": int(agents_lt13.sum()),
+        "Agents présents": int(agents_presents.sum()) if len(agents_presents) else 0,
+        "Productivité": float(df_tl["Productivité"].mean()) if len(df_tl) else np.nan,
+        "Agents < 13": int(agents_lt13.sum()) if len(agents_lt13) else 0,
         "Taux Post-travail": (sum_post.sum() / sum_work.sum()) if sum_work.sum() else np.nan,
         "Taux d'occupation": (sum_work.sum() / sum_presence.sum()) if sum_presence.sum() else np.nan,
-        "DMC": df_tl[df_tl["Tls"] != "TOTAL"]["DMC"].mean(),
-        "DMT": df_tl[df_tl["Tls"] != "TOTAL"]["DMT"].mean(),
-        "Heures Meeting": sum_meeting.sum(),
-        "Heures Training": sum_training.sum(),
-        "Heures OJT": sum_ojt.sum(),
-        "Heures Coaching Total": sum_coaching.sum(),
+        "DMC": float(df_tl["DMC"].mean()) if "DMC" in df_tl.columns and len(df_tl) else np.nan,
+        "DMT": float(df_tl["DMT"].mean()) if "DMT" in df_tl.columns and len(df_tl) else np.nan,
+        "Heures Meeting": float(sum_meeting.sum()) if len(sum_meeting) else 0.0,
+        "Heures Training": float(sum_training.sum()) if len(sum_training) else 0.0,
+        "Heures OJT": float(sum_ojt.sum()) if len(sum_ojt) else 0.0,
+        "Heures Coaching Total": float(sum_coaching.sum()) if len(sum_coaching) else 0.0,
         "% Coaching vs Connecté": (sum_coaching.sum() / sum_presence.sum()) if sum_presence.sum() else np.nan,
     }
     df_tl = pd.concat([df_tl, pd.DataFrame([total_row])], ignore_index=True)
 
+    # convert to timedelta for display in Excel
     for c in ["DMC", "DMT", "Heures Meeting", "Heures Training", "Heures OJT", "Heures Coaching Total"]:
         if c in df_tl.columns:
             df_tl[c] = pd.to_timedelta(df_tl[c], unit="s", errors="coerce")
 
+    # write sheet
     if "Flash Prod TL" in wb.sheetnames:
         del wb["Flash Prod TL"]
     ws = wb.create_sheet("Flash Prod TL")
@@ -626,10 +650,11 @@ def code5_add_tl_sheet(excel_agent_bytes: bytes) -> bytes:
     for _, row in df_tl.iterrows():
         ws.append(row.tolist())
 
-    header_fill = PatternFill("solid", "D9E1F2")
-    total_fill = PatternFill("solid", "FFF2CC")
+    # formatting & CF
     green = PatternFill("solid", "C6EFCE")
     red = PatternFill("solid", "F4CCCC")
+    header = PatternFill("solid", "D9E1F2")
+    total_fill = PatternFill("solid", "FFF2CC")
     thin = Side(style="thin")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
@@ -649,6 +674,7 @@ def code5_add_tl_sheet(excel_agent_bytes: bytes) -> bytes:
         "Heures OJT": "hh:mm:ss",
         "Heures Coaching Total": "hh:mm:ss",
     }
+
     for k, fmt in formats.items():
         if k in headers:
             col = headers[k]
@@ -656,7 +682,7 @@ def code5_add_tl_sheet(excel_agent_bytes: bytes) -> bytes:
                 ws.cell(r, col).number_format = fmt
 
     for c in ws[1]:
-        c.fill = header_fill
+        c.fill = header
         c.font = Font(bold=True)
         c.alignment = Alignment(horizontal="center")
 
@@ -666,33 +692,33 @@ def code5_add_tl_sheet(excel_agent_bytes: bytes) -> bytes:
             ws.cell(r, c).alignment = Alignment(horizontal="center")
 
     last_row = ws.max_row
+
+    # CF (exclude TOTAL)
     if last_row >= 3:
         end_row = last_row - 1
 
-        def add_cf(range_str: str, rule):
-            ws.conditional_formatting.add(MultiCellRange(range_str), rule)
-
         if "Productivité" in headers:
             colL = get_column_letter(headers["Productivité"])
-            add_cf(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2>13"], fill=green))
-            add_cf(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2<=13"], fill=red))
+            ws.conditional_formatting.add(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2>13"], fill=green))
+            ws.conditional_formatting.add(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2<=13"], fill=red))
 
         if "Taux Post-travail" in headers:
             colL = get_column_letter(headers["Taux Post-travail"])
-            add_cf(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2<=0.08"], fill=green))
-            add_cf(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2>0.08"], fill=red))
+            ws.conditional_formatting.add(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2<=0.08"], fill=green))
+            ws.conditional_formatting.add(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2>0.08"], fill=red))
 
         for nm in ["DMC", "DMT"]:
             if nm in headers:
                 colL = get_column_letter(headers[nm])
-                add_cf(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2<=TIME(0,3,0)"], fill=green))
-                add_cf(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2>TIME(0,3,0)"], fill=red))
+                ws.conditional_formatting.add(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2<=TIME(0,3,0)"], fill=green))
+                ws.conditional_formatting.add(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2>TIME(0,3,0)"], fill=red))
 
         if "Taux d'occupation" in headers:
             colL = get_column_letter(headers["Taux d'occupation"])
-            add_cf(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2>=0.7"], fill=green))
-            add_cf(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2<0.7"], fill=red))
+            ws.conditional_formatting.add(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2>=0.7"], fill=green))
+            ws.conditional_formatting.add(f"{colL}2:{colL}{end_row}", FormulaRule(formula=[f"{colL}2<0.7"], fill=red))
 
+    # TOTAL style
     for c in range(1, ws.max_column + 1):
         ws.cell(ws.max_row, c).fill = total_fill
         ws.cell(ws.max_row, c).font = Font(bold=True)
@@ -708,9 +734,9 @@ def code5_add_tl_sheet(excel_agent_bytes: bytes) -> bytes:
 
 
 # =========================
-# CODE 6: Email (MAJ coaching + counts)
+# CODE 6: Email (bandeau + tableau TL avec Agents/Coaching)
 # =========================
-def code6_build_email(excel_final_bytes: bytes, projet_upper: str, date_txt: str, signature_name: str):
+def code6_build_email_with_coaching(excel_final_bytes: bytes, projet_upper: str, date_txt: str, signature_name: str):
     df_tl = pd.read_excel(BytesIO(excel_final_bytes), sheet_name="Flash Prod TL", engine="openpyxl")
 
     total_row = df_tl[df_tl["Tls"] == "TOTAL"]
@@ -734,58 +760,80 @@ def code6_build_email(excel_final_bytes: bytes, projet_upper: str, date_txt: str
     band_dmc = sec_to_hms(dmc_sec)
     band_dmt = sec_to_hms(dmt_sec)
 
-    df_tl_view = df_tl[df_tl["Tls"] != "TOTAL"].copy()
+    # without TOTAL
+    df_view = df_tl[df_tl["Tls"] != "TOTAL"].copy()
 
-    def fmt_cell(c, v):
-        if pd.isna(v):
+    def fmt_cell(col, v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
             return "-"
-        if c in ("Taux Post-travail", "Taux d'occupation", "% Coaching vs Connecté"):
-            return f"{float(v)*100:.1f}%".replace(".", ",")
-        if c in ("DMC", "DMT", "Heures Meeting", "Heures Training", "Heures OJT", "Heures Coaching Total"):
-            return str(v) if str(v) != "NaT" else "-"
-        if c == "Productivité":
-            return f"{float(v):.1f}".replace(".", ",")
-        if c in ("Agents présents", "Agents < 13"):
+        if col in ("Taux Post-travail", "Taux d'occupation", "% Coaching vs Connecté"):
+            vv = parse_percent_any(v)
+            return "-" if pd.isna(vv) else f"{vv*100:.1f}%".replace(".", ",")
+        if col in ("DMC", "DMT", "Heures Meeting", "Heures Training", "Heures OJT", "Heures Coaching Total"):
+            s = str(v)
+            return "-" if s == "NaT" else s
+        if col in ("Productivité",):
+            try:
+                return f"{float(v):.1f}".replace(".", ",")
+            except Exception:
+                return "-"
+        if col in ("Agents présents", "Agents < 13"):
             try:
                 return str(int(float(v)))
-            except:
-                return str(v)
+            except Exception:
+                return "0"
         return str(v)
+
+    band_html = f"""
+    <table style="width:100%;margin-bottom:25px;border-radius:10px;background:#F9FAFB;text-align:center;font-size:13px;">
+      <tr style="font-weight:bold;color:#203864;">
+        <td>📈 Productivité<br><span style="font-size:18px;">{band_prod}</span></td>
+        <td>⏱️ DMC<br><span style="font-size:18px;">{band_dmc}</span></td>
+        <td>⏱️ DMT<br><span style="font-size:18px;">{band_dmt}</span></td>
+        <td>🧩 Taux Post-travail<br><span style="font-size:18px;">{band_post}</span></td>
+        <td>🎓 Coaching vs Connecté<br><span style="font-size:18px;">{band_coach}</span></td>
+        <td style="background:#E8F5E9;border-radius:8px;color:#1E8449;">
+          🎯 Taux d’occupation<br><span style="font-size:20px;font-weight:bold;">{band_occ}</span>
+        </td>
+      </tr>
+    </table>
+    """
 
     table_html = """
     <table style="border-collapse:collapse;width:100%;font-size:13px;text-align:center;">
-    <thead>
-    <tr style="background:#203864;color:white;">
-      <th>TL</th>
-      <th>Agents présents</th>
-      <th>Productivité</th>
-      <th>Agents &lt; 13</th>
-      <th>Taux Post-travail</th>
-      <th>% Coaching</th>
-      <th>DMC</th>
-      <th>DMT</th>
-      <th>Taux d’occupation</th>
-    </tr>
-    </thead><tbody>
+      <thead>
+        <tr style="background:#203864;color:white;">
+          <th>TL</th>
+          <th>Agents présents</th>
+          <th>Productivité</th>
+          <th>Agents &lt; 13</th>
+          <th>Taux Post-travail</th>
+          <th>% Coaching</th>
+          <th>DMC</th>
+          <th>DMT</th>
+          <th>Taux d’occupation</th>
+        </tr>
+      </thead><tbody>
     """
-    for i, r in df_tl_view.iterrows():
+
+    for i, r in df_view.iterrows():
         bg = "#F9FAFB" if i % 2 == 0 else "#FFFFFF"
         table_html += f"""
         <tr style="background:{bg};">
           <td>{r.get('Tls','-')}</td>
-          <td>{fmt_cell('Agents présents', r.get('Agents présents', np.nan))}</td>
-          <td>{fmt_cell('Productivité', r.get('Productivité', np.nan))}</td>
-          <td>{fmt_cell('Agents < 13', r.get('Agents < 13', np.nan))}</td>
-          <td>{fmt_cell('Taux Post-travail', r.get('Taux Post-travail', np.nan))}</td>
-          <td>{fmt_cell('% Coaching vs Connecté', r.get('% Coaching vs Connecté', np.nan))}</td>
-          <td>{fmt_cell('DMC', r.get('DMC', np.nan))}</td>
-          <td>{fmt_cell('DMT', r.get('DMT', np.nan))}</td>
-          <td>{fmt_cell("Taux d'occupation", r.get("Taux d'occupation", np.nan))}</td>
+          <td><b>{fmt_cell('Agents présents', r.get('Agents présents', np.nan))}</b></td>
+          <td><b>{fmt_cell('Productivité', r.get('Productivité', np.nan))}</b></td>
+          <td><b>{fmt_cell('Agents < 13', r.get('Agents < 13', np.nan))}</b></td>
+          <td><b>{fmt_cell('Taux Post-travail', r.get('Taux Post-travail', np.nan))}</b></td>
+          <td><b>{fmt_cell('% Coaching vs Connecté', r.get('% Coaching vs Connecté', np.nan))}</b></td>
+          <td><b>{fmt_cell('DMC', r.get('DMC', np.nan))}</b></td>
+          <td><b>{fmt_cell('DMT', r.get('DMT', np.nan))}</b></td>
+          <td><b>{fmt_cell("Taux d'occupation", r.get("Taux d'occupation", np.nan))}</b></td>
         </tr>
         """
     table_html += "</tbody></table>"
 
-    signature_name = (signature_name or "").strip() or "MAHAMID Yassine"
+    signature_name = (signature_name or "").strip() or "Yassine MAHAMID"
 
     email_html = f"""
     <div style="background:#F3F6FB;padding:30px;font-family:Calibri,Arial;">
@@ -796,18 +844,7 @@ def code6_build_email(excel_final_bytes: bytes, projet_upper: str, date_txt: str
           <div style="font-size:13px;color:#6B7280;">Données du {date_txt}</div>
         </div>
 
-        <table style="width:100%;margin-bottom:25px;border-radius:10px;background:#F9FAFB;text-align:center;font-size:13px;">
-          <tr style="font-weight:bold;color:#203864;">
-            <td>📈 Productivité<br><span style="font-size:18px;">{band_prod}</span></td>
-            <td>⏱️ DMC<br><span style="font-size:18px;">{band_dmc}</span></td>
-            <td>⏱️ DMT<br><span style="font-size:18px;">{band_dmt}</span></td>
-            <td>🧩 Taux Post-travail<br><span style="font-size:18px;">{band_post}</span></td>
-            <td>🎓 Coaching vs Connecté<br><span style="font-size:18px;">{band_coach}</span></td>
-            <td style="background:#E8F5E9;border-radius:8px;color:#1E8449;">
-              🎯 Taux d’occupation<br><span style="font-size:20px;font-weight:bold;">{band_occ}</span>
-            </td>
-          </tr>
-        </table>
+        {band_html}
 
         <p>Bonjour,</p>
         <p>
@@ -823,8 +860,8 @@ def code6_build_email(excel_final_bytes: bytes, projet_upper: str, date_txt: str
         <p style="margin-top:20px;">
           Cordialement,<br><br>
           <b style="color:#1F4E78;">{signature_name}</b><br>
-          FlashProd KPI Suite<br>
-          <span style="color:#6B7280;font-size:12px;">Developed by MAHAMID Yassine</span>
+          Analyste IDP – Workforce Management & Reporting<br>
+          <span style="color:#6B7280;font-size:12px;">FlashProd KPI Suite — Developed by MAHAMID Yassine</span>
         </p>
 
       </div>
@@ -834,6 +871,7 @@ def code6_build_email(excel_final_bytes: bytes, projet_upper: str, date_txt: str
 
 
 def copy_buttons(subject: str, html_body: str):
+    # IMPORTANT: échapper { } en f-string => {{ }}
     component = f"""
     <div style="font-family:Calibri, Arial; margin-top:10px;">
       <div style="margin-bottom:6px; font-weight:bold;">📋 Copier vers Gmail :</div>
@@ -849,9 +887,9 @@ def copy_buttons(subject: str, html_body: str):
       <div id="htmlBody" style="display:none;">{html_body}</div>
       <button style="padding:8px 14px; border:0; border-radius:6px; cursor:pointer; background:#0078D7; color:white;"
               onclick="navigator.clipboard.write([
-                new ClipboardItem({
-                  'text/html': new Blob([document.getElementById('htmlBody').innerHTML], {type:'text/html'})
-                })
+                new ClipboardItem({{
+                  'text/html': new Blob([document.getElementById('htmlBody').innerHTML], {{type:'text/html'}})
+                }})
               ])">
         ✅ Copier le corps HTML (coller formaté dans Gmail)
       </button>
@@ -861,7 +899,7 @@ def copy_buttons(subject: str, html_body: str):
 
 
 # =========================
-# FLOP (optional)
+# FLOP optional
 # =========================
 def build_flop_from_excel(excel_final_bytes: bytes, kpi_choice: str, flop_n: int, direction: str) -> pd.DataFrame:
     df_agents = pd.read_excel(BytesIO(excel_final_bytes), sheet_name="Flash Prod Agent", engine="openpyxl")
@@ -893,13 +931,14 @@ def build_flop_from_excel(excel_final_bytes: bytes, kpi_choice: str, flop_n: int
     if score_col not in df.columns:
         raise ValueError(f"KPI '{kpi_choice}' introuvable dans Flash Prod Agent.")
 
+    # remove <10min presence if possible
     if "Temps Total présence" in df.columns:
         pres_sec = df["Temps Total présence"].apply(parse_hms_any_to_seconds)
         df = df[(pres_sec.isna()) | (pres_sec >= 600)].copy()
 
     df = df[df[score_col].notna()].copy()
 
-    # auto: productivité et occupancy => worst lowest, post/dmc/dmt => worst highest
+    # auto direction: low is worse for prod/occ, high is worse for post/dmc/dmt/mpost
     if direction == "Worst (auto)":
         direction = "Worst (lowest)" if kpi_choice in ["Productivité", "Taux d'occupation"] else "Worst (highest)"
 
@@ -934,11 +973,11 @@ def flop_to_excel_bytes(df_flop: pd.DataFrame, sheet_name: str = "FLOP") -> byte
 # UI
 # =========================
 st.title("📊 FlashProd KPI Suite")
-st.caption("Pipeline BRUT + COMPO → KPI Agents + Synthèse TL (Coaching/Counts) → Excel final + Email HTML + FLOP (optionnel)")
+st.caption("BRUT + COMPO → KPI Agents + Synthèse TL (Agents présents, <13, Coaching) → Excel final + Email HTML")
 
 with st.sidebar:
     st.header("Configuration")
-    signature_name = st.text_input("Nom signature email", value="MAHAMID Yassine")
+    signature_name = st.text_input("Nom signature email", value="Yassine MAHAMID")
     projet = st.text_input("Nom du projet (ex: CNSS)", value="CNSS")
     date_input = st.text_input("Date Flash Prod (JJ/MM/AAAA)", value=datetime.today().strftime("%d/%m/%Y"))
 
@@ -949,7 +988,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("FLOP (optionnel)")
-    enable_flop = st.checkbox("Générer un fichier FLOP (worst performers)", value=False)
+    enable_flop = st.checkbox("Générer un fichier FLOP", value=False)
     kpi_choice = st.selectbox(
         "KPI pour FLOP",
         ["Productivité", "Taux d'occupation", "Taux Post-travail", "DMC", "DMT", "Moy Post-travail"],
@@ -1017,11 +1056,11 @@ try:
     agent_excel_bytes = code4_build_flash_agent_excel(df_final3)
     log_ok("✅ CODE 4 OK → Flash Prod Agent (Excel) généré")
 
-    excel_final_bytes = code5_add_tl_sheet(agent_excel_bytes)
+    excel_final_bytes = code5_add_tl_sheet_with_coaching(agent_excel_bytes)
     excel_final_name = f"Flash_Prod_{projet_upper}_{date_flash}.xlsx"
     log_ok(f"✅ CODE 5 OK → Excel final prêt ({excel_final_name})")
 
-    email_subject, email_html = code6_build_email(excel_final_bytes, projet_upper, date_txt, signature_name)
+    email_subject, email_html = code6_build_email_with_coaching(excel_final_bytes, projet_upper, date_txt, signature_name)
     log_ok("✅ CODE 6 OK → Email (Objet + Corps HTML) généré")
 
 except Exception as e:
@@ -1068,12 +1107,12 @@ with col2:
     st.subheader("👀 Aperçu – Flash Prod TL (Top 50)")
     try:
         df_tl_preview = pd.read_excel(BytesIO(excel_final_bytes), sheet_name="Flash Prod TL", engine="openpyxl")
-        st.dataframe(df_tl_preview.head(50), use_container_width=True, height=300)
+        st.dataframe(df_tl_preview.head(50), use_container_width=True, height=320)
     except Exception as e:
         st.warning(f"Aperçu TL non disponible: {e}")
 
     if enable_flop and df_flop is not None:
         st.subheader(f"👎 Aperçu FLOP – {kpi_choice} (Top {int(flop_n)})")
-        st.dataframe(df_flop, use_container_width=True, height=300)
+        st.dataframe(df_flop, use_container_width=True, height=320)
 
 st.markdown("<div style='text-align:center;color:#6c757d;font-size:12px;margin-top:16px;'>Developed by <b>MAHAMID Yassine</b></div>", unsafe_allow_html=True)
